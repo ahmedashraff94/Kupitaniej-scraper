@@ -1,0 +1,41 @@
+name: KupTaniej Scraper
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4 playwright
+          playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          BOT_TOKEN:   ${{ secrets.BOT_TOKEN }}
+          MAX_PER_RUN: ${{ secrets.MAX_PER_RUN }}
+        run: python scraper.py
+
+      - name: Save state back to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "state: update posted ASINs"
+          git pull origin main --no-rebase -X ours || true
+          git push origin main
