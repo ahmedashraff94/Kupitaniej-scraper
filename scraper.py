@@ -14,7 +14,8 @@ CHANNEL      = "@KupTaniej"
 CHANNEL_MIN  = "@KupTaniejj"
 AFFILIATE    = "kuptaniej04-21"
 STATE_FILE   = "state.json"
-MAX_PER_RUN  = int(os.environ.get("MAX_PER_RUN", "5"))
+MAX_PER_RUN  = int(os.environ.get("MAX_PER_RUN", "50"))
+MAX_PER_CAT  = 3
 EXPIRY_HOURS = 48
 MIN_DISCOUNT = 10
 MAX_DISCOUNT = 85
@@ -198,7 +199,6 @@ def get_product_details(asin: str, page):
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(random.randint(2000, 3500))
 
-        # Title
         title = ""
         for sel in ["#productTitle", "#title span", "h1.a-size-large"]:
             el = page.query_selector(sel)
@@ -212,7 +212,6 @@ def get_product_details(asin: str, page):
             print(f"  [SKIP] {asin} -- no title found")
             return None
 
-        # Discount from product page (red text like "-13%")
         page_discount = None
         for sel in [".savingsPercentage", "span.a-color-price"]:
             el = page.query_selector(sel)
@@ -223,7 +222,6 @@ def get_product_details(asin: str, page):
                     page_discount = int(m.group(1))
                     break
 
-        # Original price from product page
         page_orig_price = None
         for sel in [".basisPrice .a-offscreen", "span.a-text-price .a-offscreen"]:
             el = page.query_selector(sel)
@@ -235,11 +233,9 @@ def get_product_details(asin: str, page):
                         page_orig_price = v
                         break
 
-        # Screenshot for main channel
         screenshot_path = f"/tmp/{asin}.png"
         page.screenshot(path=screenshot_path, full_page=False)
 
-        # Product image URL for minimal channel
         product_image = None
         for sel in ["#landingImage", "#imgTagWrapperId img", "#main-image-container img", ".a-dynamic-image"]:
             el = page.query_selector(sel)
@@ -249,7 +245,6 @@ def get_product_details(asin: str, page):
                     product_image = src
                     break
 
-        # Download product image
         product_image_path = None
         if product_image:
             try:
@@ -322,7 +317,6 @@ def send_telegram(asin, title, price, orig_price, discount_pct, screenshot):
 # ─── Telegram post: minimal (second channel) ─────────────────────────────────
 
 def send_telegram_minimal(asin, title, product_image_path):
-    """Post to second channel: product image + title + affiliate link only."""
     affiliate_url = f"https://www.amazon.pl/dp/{asin}?tag={AFFILIATE}"
     caption = f"{title}\n\n{affiliate_url}"
 
@@ -344,7 +338,6 @@ def send_telegram_minimal(asin, title, product_image_path):
         except Exception as e:
             print(f"  [WARN] minimal sendPhoto exception: {e}")
 
-    # Fallback: text only with link preview
     try:
         resp = requests.post(
             f"{api}/sendMessage",
@@ -363,7 +356,7 @@ def send_telegram_minimal(asin, title, product_image_path):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"[START] {datetime.now(timezone.utc).isoformat()}  MAX_PER_RUN={MAX_PER_RUN}")
+    print(f"[START] {datetime.now(timezone.utc).isoformat()}  MAX_PER_RUN={MAX_PER_RUN}  MAX_PER_CAT={MAX_PER_CAT}")
 
     posted_snapshot = load_state()
 
@@ -409,10 +402,15 @@ def main():
 
         # Phase 2: Get product details and post
         posted_count = 0
+        cat_counts = {}
 
         for c in candidates:
             if posted_count >= MAX_PER_RUN:
                 break
+
+            cat = c.get("category", "")
+            if cat_counts.get(cat, 0) >= MAX_PER_CAT:
+                continue
 
             asin         = c["asin"]
             price        = c["price"]
@@ -423,13 +421,12 @@ def main():
                 print(f"  [SKIP] {asin} -- posted in a parallel check")
                 continue
 
-            print(f"[ITEM] {asin}  {discount_pct}% off  {price} <- was {orig_price}")
+            print(f"[ITEM] {asin}  {discount_pct}% off  {price} <- was {orig_price}  [{cat}]")
 
             details = get_product_details(asin, page)
             if not details:
                 continue
 
-            # Use product page discount if available (more accurate)
             final_discount = discount_pct
             final_orig     = orig_price
 
@@ -447,24 +444,26 @@ def main():
                     continue
                 print(f"  Using page orig price: {final_orig} -> {final_discount}%")
 
-            # Post to main channel (full details + screenshot)
             ok = send_telegram(
                 asin, details["title"],
                 price, final_orig, final_discount,
                 details["screenshot"],
             )
 
-            # Post to minimal channel (product image + title + link)
             if ok:
                 send_telegram_minimal(asin, details["title"], details.get("product_image"))
                 mark_posted(asin)
                 posted_count += 1
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                print(f"  [{cat}: {cat_counts[cat]}/{MAX_PER_CAT}]")
                 time.sleep(random.uniform(2, 4))
 
         ctx.close()
         browser.close()
 
     print(f"[DONE] Posted {posted_count} of {MAX_PER_RUN} allowed.")
+    for cat, count in sorted(cat_counts.items()):
+        print(f"  {cat}: {count}")
 
 
 if __name__ == "__main__":
