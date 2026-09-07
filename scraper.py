@@ -177,7 +177,7 @@ def scrape_page(url: str, page, is_bestseller: bool = False) -> list:
             if m:
                 badge_pct = int(m.group(1))
 
-        if orig_price <= price and badge_pct >= MIN_DISCOUNT:
+        if orig_price <= price and badge_pct >= 1:
             orig_price = round(price / (1 - badge_pct / 100), 2)
 
         # Calculate discount
@@ -188,7 +188,7 @@ def scrape_page(url: str, page, is_bestseller: bool = False) -> list:
                 discount_pct = 0
                 orig_price = 0.0
 
-        # For deal pages: require discount. For bestsellers: accept all.
+        # For deal pages: require MIN_DISCOUNT. For bestsellers: accept all.
         if not is_bestseller and discount_pct < MIN_DISCOUNT:
             continue
 
@@ -300,29 +300,30 @@ def get_product_details(asin: str, page):
 
 # ─── Telegram post: full (main channel) ──────────────────────────────────────
 
-def send_telegram(asin, title, price, orig_price, discount_pct, screenshot):
+def send_telegram(asin, title, price, orig_price, discount_pct, screenshot, source="deal"):
     affiliate_url = f"https://www.amazon.pl/dp/{asin}?tag={AFFILIATE}"
 
-    if discount_pct >= MIN_DISCOUNT and orig_price > price:
-        caption = (
-            f"\U0001f525 Znizka {discount_pct}%! \U0001f525\n"
-            f"\n"
-            f"\U0001f451 {title}\n"
-            f"\n"
-            f"\U0001f4b0 Cena: {price:,.2f} zl zamiast {orig_price:,.2f} zl\n"
-            f"\n"
-            f"\U0001f6d2 Kup teraz: {affiliate_url}"
-        )
+    # Header: deals get fire emoji, bestsellers get star
+    if source == "deal" and discount_pct >= MIN_DISCOUNT:
+        header = f"\U0001f525 Znizka {discount_pct}%! \U0001f525"
     else:
-        caption = (
-            f"\U0001f31f Hit sprzedaży! \U0001f31f\n"
-            f"\n"
-            f"\U0001f451 {title}\n"
-            f"\n"
-            f"\U0001f4b0 Cena: {price:,.2f} zl\n"
-            f"\n"
-            f"\U0001f6d2 Kup teraz: {affiliate_url}"
-        )
+        header = f"\U0001f31f Hit sprzedazy! \U0001f31f"
+
+    # Price line: show discount info if any discount exists
+    if orig_price > price and discount_pct > 0:
+        price_line = f"\U0001f4b0 Cena: {price:,.2f} zl zamiast {orig_price:,.2f} zl (-{discount_pct}%)"
+    else:
+        price_line = f"\U0001f4b0 Cena: {price:,.2f} zl"
+
+    caption = (
+        f"{header}\n"
+        f"\n"
+        f"\U0001f451 {title}\n"
+        f"\n"
+        f"{price_line}\n"
+        f"\n"
+        f"\U0001f6d2 Kup teraz: {affiliate_url}"
+    )
 
     api = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -450,9 +451,9 @@ def main():
 
         # Sort: discounted items first (by discount%), then bestsellers (by reviews)
         candidates.sort(key=lambda x: (
-            0 if x["has_discount"] else 1,   # discounted first
-            -x["discount_pct"],               # highest discount first
-            -x["reviews"],                    # most reviewed first
+            0 if x["has_discount"] else 1,
+            -x["discount_pct"],
+            -x["reviews"],
         ))
 
         print(f"[INFO] {len(candidates)} unique new candidates")
@@ -481,14 +482,14 @@ def main():
             price        = c["price"]
             orig_price   = c["orig_price"]
             discount_pct = c["discount_pct"]
-            has_discount = c["has_discount"]
+            source       = c.get("source", "deal")
 
             if is_posted(asin, load_state()):
                 print(f"  [SKIP] {asin} -- posted in a parallel check")
                 continue
 
-            tag = f"{discount_pct}% off" if has_discount else "bestseller"
-            print(f"[ITEM] {asin}  {tag}  {price} zl  [{cat}]")
+            tag = f"{discount_pct}% off" if discount_pct > 0 else "no discount"
+            print(f"[ITEM] {asin}  {tag}  {price} zl  [{cat}] ({source})")
 
             details = get_product_details(asin, page)
             if not details:
@@ -498,28 +499,24 @@ def main():
             final_discount = discount_pct
             final_orig     = orig_price
 
-            if has_discount:
-                if details["page_discount"] and MIN_DISCOUNT <= details["page_discount"] <= MAX_DISCOUNT:
-                    final_discount = details["page_discount"]
-                    final_orig = round(price / (1 - final_discount / 100), 2)
-                    print(f"  Using page discount: {final_discount}% (was {discount_pct}%)")
+            if details["page_discount"] and 1 <= details["page_discount"] <= MAX_DISCOUNT:
+                final_discount = details["page_discount"]
+                final_orig = round(price / (1 - final_discount / 100), 2)
+                print(f"  Using page discount: {final_discount}% (was {discount_pct}%)")
 
-                if details["page_orig_price"] and details["page_orig_price"] > price:
-                    final_orig = details["page_orig_price"]
-                    final_discount = round((final_orig - price) / final_orig * 100)
-                    if final_discount > MAX_DISCOUNT:
-                        final_discount = 0
-                        final_orig = 0.0
-                        has_discount = False
-                    elif final_discount < MIN_DISCOUNT:
-                        has_discount = False
-                        final_discount = 0
-                    print(f"  Using page orig price: {final_orig} -> {final_discount}%")
+            if details["page_orig_price"] and details["page_orig_price"] > price:
+                final_orig = details["page_orig_price"]
+                final_discount = round((final_orig - price) / final_orig * 100)
+                if final_discount > MAX_DISCOUNT:
+                    final_discount = 0
+                    final_orig = 0.0
+                print(f"  Using page orig price: {final_orig} -> {final_discount}%")
 
             ok = send_telegram(
                 asin, details["title"],
-                price, final_orig, final_discount if has_discount else 0,
+                price, final_orig, final_discount,
                 details["screenshot"],
+                source=source,
             )
 
             if ok:
