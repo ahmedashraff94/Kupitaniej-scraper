@@ -20,29 +20,33 @@ EXPIRY_HOURS = 48
 MIN_DISCOUNT = 10
 MAX_DISCOUNT = 85
 
-# ─── Categories: deals (% off filter) + bestsellers per department ───────────
-def _urls(dept):
+# ─── Categories: deals + bestsellers per department ──────────────────────────
+def _deal_urls(dept):
     return [
         f"https://www.amazon.pl/s?i={dept}&rh=p_n_pct-off-with-tax%3A10-&page=1",
         f"https://www.amazon.pl/s?i={dept}&rh=p_n_pct-off-with-tax%3A10-&page=2",
-        f"https://www.amazon.pl/s?i={dept}&s=exact-aware-popularity-rank&page=1",
     ]
 
-CATEGORIES = {
-    "Elektronika":          _urls("electronics"),
-    "Telefony":             _urls("mobile-phones"),
-    "Komputery":            _urls("computers"),
-    "Dom i kuchnia":        _urls("kitchen"),
-    "Uroda":                _urls("beauty"),
-    "Dzieci i niemowleta":  _urls("baby"),
-    "Sport i outdoor":      _urls("sporting"),
-    "Ksiazki":              _urls("stripbooks"),
-    "Zabawki":              _urls("toys"),
-    "Moda":                 _urls("fashion"),
-    "Zywnosc":              _urls("grocery"),
-    "Motoryzacja":          _urls("automotive"),
-    "Zdrowie":              _urls("hpc"),
-    "Artykuly biurowe":     _urls("office-products"),
+def _best_urls(dept):
+    return [
+        f"https://www.amazon.pl/s?i={dept}&s=exact-aware-popularity-rank&page=1",
+        f"https://www.amazon.pl/s?i={dept}&s=exact-aware-popularity-rank&page=2",
+    ]
+
+DEPARTMENTS = [
+    "electronics", "mobile-phones", "computers", "kitchen", "beauty",
+    "baby", "sporting", "stripbooks", "toys", "fashion",
+    "grocery", "automotive", "hpc", "office-products",
+]
+
+DEPT_NAMES = {
+    "electronics": "Elektronika", "mobile-phones": "Telefony",
+    "computers": "Komputery", "kitchen": "Dom i kuchnia",
+    "beauty": "Uroda", "baby": "Dzieci i niemowleta",
+    "sporting": "Sport i outdoor", "stripbooks": "Ksiazki",
+    "toys": "Zabawki", "fashion": "Moda",
+    "grocery": "Zywnosc", "automotive": "Motoryzacja",
+    "hpc": "Zdrowie", "office-products": "Artykuly biurowe",
 }
 
 # ─── State helpers ────────────────────────────────────────────────────────────
@@ -90,7 +94,7 @@ def _age(ts, now):
     except Exception:
         return 9999
 
-# ─── Scrape search page using Playwright ─────────────────────────────────────
+# ─── Price parsing ───────────────────────────────────────────────────────────
 
 def parse_price(text: str) -> float:
     text = (text
@@ -110,7 +114,12 @@ def parse_price(text: str) -> float:
     except ValueError:
         return 0.0
 
-def scrape_category(url: str, page) -> list:
+# ─── Scrape search page using Playwright ─────────────────────────────────────
+
+def scrape_page(url: str, page, is_bestseller: bool = False) -> list:
+    """Scrape a search results page.
+    is_bestseller=True: accept items even without discounts.
+    is_bestseller=False: only items with MIN_DISCOUNT+."""
     candidates = []
     retries = 2
 
@@ -143,6 +152,7 @@ def scrape_category(url: str, page) -> list:
         if price <= 0:
             continue
 
+        # --- Original price (struck-through, skip per-unit prices) ---
         orig_price = 0.0
         for el in item.select(".a-price.a-text-price .a-offscreen"):
             parent = el.parent
@@ -159,6 +169,7 @@ def scrape_category(url: str, page) -> list:
                 orig_price = v
                 break
 
+        # --- Discount badge ---
         badge_pct = 0
         badge = item.select_one(".savingsPercentage, .a-badge-text")
         if badge:
@@ -169,14 +180,30 @@ def scrape_category(url: str, page) -> list:
         if orig_price <= price and badge_pct >= MIN_DISCOUNT:
             orig_price = round(price / (1 - badge_pct / 100), 2)
 
-        if orig_price <= price:
+        # Calculate discount
+        discount_pct = 0
+        if orig_price > price:
+            discount_pct = round((orig_price - price) / orig_price * 100)
+            if discount_pct > MAX_DISCOUNT:
+                discount_pct = 0
+                orig_price = 0.0
+
+        # For deal pages: require discount. For bestsellers: accept all.
+        if not is_bestseller and discount_pct < MIN_DISCOUNT:
             continue
 
-        discount_pct = round((orig_price - price) / orig_price * 100)
-        if discount_pct < MIN_DISCOUNT:
-            continue
-        if discount_pct > MAX_DISCOUNT:
-            continue
+        # --- Rating (for sorting bestsellers) ---
+        rating = 0.0
+        rating_el = item.select_one(".a-icon-alt")
+        if rating_el:
+            m = re.search(r"([\d,\.]+)", rating_el.get_text())
+            if m:
+                rating = parse_price(m.group(1))
+
+        reviews = 0
+        reviews_el = item.select_one(".a-size-small .a-link-normal .a-size-base")
+        if reviews_el:
+            reviews = int(re.sub(r"[^\d]", "", reviews_el.get_text()) or 0)
 
         candidates.append({
             "asin":         asin,
@@ -184,6 +211,9 @@ def scrape_category(url: str, page) -> list:
             "orig_price":   orig_price,
             "discount_pct": discount_pct,
             "badge_pct":    badge_pct,
+            "rating":       rating,
+            "reviews":      reviews,
+            "has_discount":  discount_pct >= MIN_DISCOUNT,
         })
 
     return candidates
@@ -272,15 +302,27 @@ def get_product_details(asin: str, page):
 
 def send_telegram(asin, title, price, orig_price, discount_pct, screenshot):
     affiliate_url = f"https://www.amazon.pl/dp/{asin}?tag={AFFILIATE}"
-    caption = (
-        f"\U0001f525 Znizka {discount_pct}%! \U0001f525\n"
-        f"\n"
-        f"\U0001f451 {title}\n"
-        f"\n"
-        f"\U0001f4b0 Cena: {price:,.2f} zl zamiast {orig_price:,.2f} zl\n"
-        f"\n"
-        f"\U0001f6d2 Kup teraz: {affiliate_url}"
-    )
+
+    if discount_pct >= MIN_DISCOUNT and orig_price > price:
+        caption = (
+            f"\U0001f525 Znizka {discount_pct}%! \U0001f525\n"
+            f"\n"
+            f"\U0001f451 {title}\n"
+            f"\n"
+            f"\U0001f4b0 Cena: {price:,.2f} zl zamiast {orig_price:,.2f} zl\n"
+            f"\n"
+            f"\U0001f6d2 Kup teraz: {affiliate_url}"
+        )
+    else:
+        caption = (
+            f"\U0001f31f Bestseller \U0001f31f\n"
+            f"\n"
+            f"\U0001f451 {title}\n"
+            f"\n"
+            f"\U0001f4b0 Cena: {price:,.2f} zl\n"
+            f"\n"
+            f"\U0001f6d2 Kup teraz: {affiliate_url}"
+        )
 
     api = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -373,26 +415,49 @@ def main():
         )
         page = ctx.new_page()
 
-        # Phase 1: Scrape search pages for candidates
-        for cat_name, urls in CATEGORIES.items():
+        # Phase 1: Scrape all categories
+        for dept in DEPARTMENTS:
+            cat_name = DEPT_NAMES[dept]
             print(f"[CAT] {cat_name}")
-            for url in urls:
-                label = "bestsellers" if "popularity" in url else f"page {url.split(chr(61))[-1]}"
-                items = scrape_category(url, page)
-                print(f"  {label} -> {len(items)} hits")
+
+            # Deals (discount required)
+            for url in _deal_urls(dept):
+                items = scrape_page(url, page, is_bestseller=False)
+                print(f"  deals -> {len(items)} hits")
                 for item in items:
                     asin = item["asin"]
-                    if asin in seen:
-                        continue
-                    if is_posted(asin, posted_snapshot):
+                    if asin in seen or is_posted(asin, posted_snapshot):
                         continue
                     seen.add(asin)
                     item["category"] = cat_name
+                    item["source"] = "deal"
                     candidates.append(item)
                 time.sleep(random.uniform(1.5, 3.0))
 
-        candidates.sort(key=lambda x: x["discount_pct"], reverse=True)
+            # Bestsellers (no discount required)
+            for url in _best_urls(dept):
+                items = scrape_page(url, page, is_bestseller=True)
+                print(f"  bestsellers -> {len(items)} hits")
+                for item in items:
+                    asin = item["asin"]
+                    if asin in seen or is_posted(asin, posted_snapshot):
+                        continue
+                    seen.add(asin)
+                    item["category"] = cat_name
+                    item["source"] = "bestseller"
+                    candidates.append(item)
+                time.sleep(random.uniform(1.5, 3.0))
+
+        # Sort: discounted items first (by discount%), then bestsellers (by reviews)
+        candidates.sort(key=lambda x: (
+            0 if x["has_discount"] else 1,   # discounted first
+            -x["discount_pct"],               # highest discount first
+            -x["reviews"],                    # most reviewed first
+        ))
+
         print(f"[INFO] {len(candidates)} unique new candidates")
+        discounted = sum(1 for c in candidates if c["has_discount"])
+        print(f"  {discounted} with discount, {len(candidates) - discounted} bestsellers without discount")
 
         if not candidates:
             print("[DONE] Nothing new to post.")
@@ -416,37 +481,44 @@ def main():
             price        = c["price"]
             orig_price   = c["orig_price"]
             discount_pct = c["discount_pct"]
+            has_discount = c["has_discount"]
 
             if is_posted(asin, load_state()):
                 print(f"  [SKIP] {asin} -- posted in a parallel check")
                 continue
 
-            print(f"[ITEM] {asin}  {discount_pct}% off  {price} <- was {orig_price}  [{cat}]")
+            tag = f"{discount_pct}% off" if has_discount else "bestseller"
+            print(f"[ITEM] {asin}  {tag}  {price} zl  [{cat}]")
 
             details = get_product_details(asin, page)
             if not details:
                 continue
 
+            # Use product page discount if available (more accurate)
             final_discount = discount_pct
             final_orig     = orig_price
 
-            if details["page_discount"] and MIN_DISCOUNT <= details["page_discount"] <= MAX_DISCOUNT:
-                final_discount = details["page_discount"]
-                recalc_orig = round(price / (1 - final_discount / 100), 2)
-                final_orig = recalc_orig
-                print(f"  Using page discount: {final_discount}% (was {discount_pct}%)")
+            if has_discount:
+                if details["page_discount"] and MIN_DISCOUNT <= details["page_discount"] <= MAX_DISCOUNT:
+                    final_discount = details["page_discount"]
+                    final_orig = round(price / (1 - final_discount / 100), 2)
+                    print(f"  Using page discount: {final_discount}% (was {discount_pct}%)")
 
-            if details["page_orig_price"] and details["page_orig_price"] > price:
-                final_orig = details["page_orig_price"]
-                final_discount = round((final_orig - price) / final_orig * 100)
-                if final_discount < MIN_DISCOUNT or final_discount > MAX_DISCOUNT:
-                    print(f"  [SKIP] {asin} -- page discount {final_discount}% out of range")
-                    continue
-                print(f"  Using page orig price: {final_orig} -> {final_discount}%")
+                if details["page_orig_price"] and details["page_orig_price"] > price:
+                    final_orig = details["page_orig_price"]
+                    final_discount = round((final_orig - price) / final_orig * 100)
+                    if final_discount > MAX_DISCOUNT:
+                        final_discount = 0
+                        final_orig = 0.0
+                        has_discount = False
+                    elif final_discount < MIN_DISCOUNT:
+                        has_discount = False
+                        final_discount = 0
+                    print(f"  Using page orig price: {final_orig} -> {final_discount}%")
 
             ok = send_telegram(
                 asin, details["title"],
-                price, final_orig, final_discount,
+                price, final_orig, final_discount if has_discount else 0,
                 details["screenshot"],
             )
 
