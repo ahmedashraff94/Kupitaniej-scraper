@@ -315,7 +315,7 @@ def send_telegram(asin, title, price, orig_price, discount_pct, screenshot):
         )
     else:
         caption = (
-            f"\U0001f31f Bestseller \U0001f31f\n"
+            f"\U0001f31f Hit sprzedaży! \U0001f31f\n"
             f"\n"
             f"\U0001f451 {title}\n"
             f"\n"
